@@ -52,8 +52,48 @@
 static char stack[SX127X_STACKSIZE];
 static kernel_pid_t _recv_pid;
 
-static char message[32];
+static char message[256];
 static sx127x_t sx127x;
+
+//////////////////////////////////////////
+//////////// Global Variables ////////////
+//////////////////////////////////////////
+
+/* Messages counter when sending */
+int messageCounter = 0;
+
+
+/* Username */
+#define MAX_USERNAME_LEN 32
+char *username = NULL;
+
+/* Channels */
+#define MAX_CHANNELS     16
+#define MAX_CHANNEL_LEN  32
+
+static char subscribed_channels[MAX_CHANNELS][MAX_CHANNEL_LEN];
+static int  channel_count = 0;
+
+/* Storing user information */
+typedef struct {
+    char name[MAX_USERNAME_LEN];
+    int last_msg_id;
+    uint32_t last_seen;   // timestamp logique
+} user_t;
+
+/* Timestamp to track last user activity */
+static uint32_t user_timestamp = 0;
+
+/* Users management */
+#define MAX_USERS 16
+static user_t users[MAX_USERS];
+static int user_count = 0;
+
+//////////////////////////////////////////
+
+/// Functions declaration
+static int find_oldest_user(void);
+static void update_user(const char *name, int msg_id);
 
 int lora_setup_cmd(int argc, char **argv)
 {
@@ -480,11 +520,47 @@ static void _event_cb(netdev_t *dev, netdev_event_t event)
         case NETDEV_EVENT_RX_COMPLETE:
             len = dev->driver->recv(dev, NULL, 0, 0);
             dev->driver->recv(dev, message, len, &packet_info);
-            printf(
-                "{Payload: \"%s\" (%d bytes), RSSI: %i, SNR: %i, TOA: %" PRIu32 "}\n",
-                message, (int)len,
-                packet_info.rssi, (int)packet_info.snr,
-                sx127x_get_time_on_air((const sx127x_t *)dev, len));
+            // printf(
+            //     "{Payload: \"%s\" (%d bytes), RSSI: %i, SNR: %i, TOA: %" PRIu32 "}\n",
+            //     message, (int)len,
+            //     packet_info.rssi, (int)packet_info.snr,
+            //     sx127x_get_time_on_air((const sx127x_t *)dev, len));
+            char sender[32];
+            char target[32];
+            char msg_content[256];
+            int msg_id;
+
+            if (strchr(message, '@') != NULL) {
+
+                if (sscanf(message, "%31[^@]@%31[^:]:%d:%63[^\n]",
+                        sender, target, &msg_id, msg_content) == 4) {
+
+                    printf("[PRIVATE] %s -> %s (%d): %s\n",
+                        sender, target, msg_id, msg_content);
+
+                    update_user(sender, msg_id);
+                }
+            }
+
+            else if (strchr(message, '#') != NULL) {
+
+                if (sscanf(message, "%31[^#]#%31[^:]:%d:%63[^\n]",sender, target, &msg_id, msg_content) == 4) {
+
+                    for (int i = 0; i < channel_count; i++) {
+                        if (strcmp(subscribed_channels[i], target) == 0) {
+                            printf("[CHANNEL #%s] %s -> %s (%d): %s\n",
+                                target, sender, target, msg_id, msg_content);
+
+                            update_user(sender, msg_id);
+                            break;
+                        }
+                    }
+                }
+            }
+            else {
+                printf("Unknown message format\n");
+            }
+
             break;
 
         case NETDEV_EVENT_TX_COMPLETE:
@@ -560,25 +636,123 @@ int init_sx1272_cmd(int argc, char **argv)
         return 0;
 }
 
-int messageCounter = 0;
 
-int chat_message(int argc, char **argv)
+
+static int find_oldest_user(void)
 {
-    if (argc <= 3) {
-        puts("usage: mp <username> <target> <message");
-        return 1; 
+    if (user_count == 0) {
+        return -1;
     }
 
-    printf("Sending private message to %s\n", argv[3]);
+    int oldest = 0;
+    for (int i = 1; i < user_count; i++) {
+        if (users[i].last_seen < users[oldest].last_seen) {
+            oldest = i;
+        }
+    }
+    return oldest;
+}
 
-    const char *username = argv[1];
-    const char *target = argv[2];
+static void update_user(const char *name, int msg_id)
+{
+    user_timestamp++;
+
+    /* utilisateur déjà connu */
+    for (int i = 0; i < user_count; i++) {
+        if (strcmp(users[i].name, name) == 0) {
+            users[i].last_msg_id = msg_id;
+            users[i].last_seen = user_timestamp;
+            return;
+        }
+    }
+
+    /* nouveau utilisateur */
+    if (user_count < MAX_USERS) {
+        strncpy(users[user_count].name, name, MAX_USERNAME_LEN - 1);
+        users[user_count].name[MAX_USERNAME_LEN - 1] = '\0';
+        users[user_count].last_msg_id = msg_id;
+        users[user_count].last_seen = user_timestamp;
+        user_count++;
+    }
+    else {
+        /* tableau plein : remplacer plus ancien */
+        int oldest = find_oldest_user();
+
+        printf("User table full replacing %s\n", users[oldest].name);
+
+        strncpy(users[oldest].name, name, MAX_USERNAME_LEN - 1);
+        users[oldest].name[MAX_USERNAME_LEN - 1] = '\0';
+        users[oldest].last_msg_id = msg_id;
+        users[oldest].last_seen = user_timestamp;
+    }
+}
+
+int users_cmd(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    printf("Known users (%d):\n", user_count);
+
+    for (int i = 0; i < user_count; i++) {
+        printf("- %s (last msg id: %d)\n",
+               users[i].name,
+               users[i].last_msg_id);
+    }
+
+    return 0;
+}
+
+
+
+
+int set_username_cmd(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("usage: %s <username>\n", argv[0]);
+        return 1;
+    }
+
+    free(username);
+    username = malloc(MAX_USERNAME_LEN);
+    if (username == NULL) {
+        printf("Failed to allocate memory for username\n");
+        return 1;
+    }
+    username = strncpy(username, argv[1], MAX_USERNAME_LEN - 1);
+    username[MAX_USERNAME_LEN - 1] = '\0';
+    printf("Username set to: %s\n", username);
+    return 0;
+}
+
+int msg_cmd(int argc, char **argv)
+{
+    if (argc < 3) {
+        printf("usage: %s <to|*> <message>\n", argv[0]);
+        return 1;
+    }
+
+    if (username == NULL) {
+        printf("Username should be set before sending messages. Please set it first.\n");
+        return 1;
+    }
+
+    const char *target = argv[1];
+    const char *message = argv[2];
     const int message_number = messageCounter++;
-    const char *message = argv[3];
 
-    // 123@*:12:Salut à tous
-    char *payload = malloc(strlen(username) + strlen(target) + strlen(message) + 3);
-    sprintf(payload, "%s@%s:%d:%s", username, target, message_number, message);
+    /* '@' + ':' + ':' + '\0' = 4,  message_number (int32) max 10 digits */
+    int payload_size = strlen(username) + strlen(target) + strlen(message) + 4 + 10;
+
+    char *payload = malloc(payload_size);
+    if (payload == NULL) {
+        printf("Failed to allocate memory for payload\n");
+        return 1;
+    }
+
+    snprintf(payload, payload_size, "%s@%s:%d:%s", username, target, message_number, message);
+
+    printf("Sending: %s\n", payload);
 
     iolist_t iolist = {
         .iol_base = payload,
@@ -591,26 +765,88 @@ int chat_message(int argc, char **argv)
     }
 
     free(payload);
-
     return 0;
 }
 
+int subscribe_cmd(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("usage: %s <channel>\n", argv[0]);
+        return 1;
+    }
+
+    const char *channel = argv[1];
+
+    /* vérifier si déjà abonné */
+    for (int i = 0; i < channel_count; i++) {
+        if (strcmp(subscribed_channels[i], channel) == 0) {
+            printf("Already subscribed to #%s\n", channel);
+            return 0;
+        }
+    }
+
+    /* vérifier si la table est pleine */
+    if (channel_count >= MAX_CHANNELS) {
+        printf("Cannot subscribe: max %d channels reached\n", MAX_CHANNELS);
+        return 1;
+    }
+
+    /* ajouter */
+    strncpy(subscribed_channels[channel_count], channel, MAX_CHANNEL_LEN - 1);
+    subscribed_channels[channel_count][MAX_CHANNEL_LEN - 1] = '\0';
+    channel_count++;
+
+    printf("Subscribed to #%s\n", channel);
+    return 0;
+}
+
+int unsubscribe_cmd(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("usage: %s <channel>\n", argv[0]);
+        return 1;
+    }
+
+    const char *channel = argv[1];
+
+    for (int i = 0; i < channel_count; i++) {
+        if (strcmp(subscribed_channels[i], channel) == 0) {
+
+            /* décaler les entrées suivantes vers la gauche */
+            for (int j = i; j < channel_count - 1; j++) {
+                strncpy(subscribed_channels[j], subscribed_channels[j + 1],
+                        MAX_CHANNEL_LEN);
+            }
+            channel_count--;
+
+            printf("Unsubscribed from #%s\n", channel);
+            return 0;
+        }
+    }
+
+    printf("Not subscribed to #%s\n", channel);
+    return 1;
+}
 
 static const shell_command_t shell_commands[] = {
-	{ "init",    "Initialize SX1272",     					init_sx1272_cmd },
-	{ "setup",    "Initialize LoRa modulation settings",     lora_setup_cmd },
-    { "implicit", "Enable implicit header",                  implicit_cmd },
-    { "crc",      "Enable CRC",                              crc_cmd },
-    { "payload",  "Set payload length (implicit header)",    payload_cmd },
-    { "random",   "Get random number from sx127x",           random_cmd },
-    { "syncword", "Get/Set the syncword",                    syncword_cmd },
-    { "rx_timeout", "Set the RX timeout",                    rx_timeout_cmd },
-    { "channel",  "Get/Set channel frequency (in Hz)",       channel_cmd },
-    { "register", "Get/Set value(s) of registers of sx127x", register_cmd },
-    { "send",     "Send raw payload string",                 send_cmd },
-    { "listen",   "Start raw payload listener",              listen_cmd },
-    { "reset",    "Reset the sx127x device",                 reset_cmd },
-    { "chat",     "Send a chat message to a channel",       chat_message },
+	{ "init",    "Initialize SX1272",     					    init_sx1272_cmd },
+	{ "setup",    "Initialize LoRa modulation settings",        lora_setup_cmd },
+    { "implicit", "Enable implicit header",                     implicit_cmd },
+    { "crc",      "Enable CRC",                                 crc_cmd },
+    { "payload",  "Set payload length (implicit header)",       payload_cmd },
+    { "random",   "Get random number from sx127x",              random_cmd },
+    { "syncword", "Get/Set the syncword",                       syncword_cmd },
+    { "rx_timeout", "Set the RX timeout",                       rx_timeout_cmd },
+    { "channel",  "Get/Set channel frequency (in Hz)",          channel_cmd },
+    { "register", "Get/Set value(s) of registers of sx127x",    register_cmd },
+    { "send",     "Send raw payload string",                    send_cmd },
+    { "listen",   "Start raw payload listener",                 listen_cmd },
+    { "reset",    "Reset the sx127x device",                    reset_cmd },
+    { "setname", "Set username (setname <username>)",           set_username_cmd },
+    { "msg",      "Send unicast/broadcast msg (msg <to> <txt>)",msg_cmd },
+    { "subscribe",   "Subscribe to a channel (#channel)",       subscribe_cmd },
+    { "unsubscribe", "Unsubscribe from a channel (#channel)",   unsubscribe_cmd },
+    { "users",   "List known users",                            users_cmd },
     { NULL, NULL, NULL }
 };
 
