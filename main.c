@@ -89,11 +89,32 @@ static uint32_t user_timestamp = 0;
 static user_t users[MAX_USERS];
 static int user_count = 0;
 
+typedef struct history_elt{
+    char from[MAX_USERNAME_LEN];
+    int msg_id;
+    char content[256];
+}hist_elt_t;
+
+static hist_elt_t hist_buf[32];
+uint8_t hist_first=0;
+uint8_t hist_last=0;
+
 //////////////////////////////////////////
 
 /// Functions declaration
 static int find_oldest_user(void);
 static void update_user(const char *name, int msg_id);
+
+void update_hist(char* from,int from_l,int msg_id,char* msg,int msg_l){
+    strncpy(hist_buf[hist_last].from,from,from_l);
+    strncpy(hist_buf[hist_last].from,from,from_l);
+    hist_buf[hist_last].msg_id=msg_id;
+    strncpy(hist_buf[hist_last].content,msg,msg_l);
+    hist_last=(hist_last+1)%32;
+    if (hist_last==hist_first){
+        hist_first=(hist_first+1)%32;
+    }
+}
 
 int lora_setup_cmd(int argc, char **argv)
 {
@@ -537,6 +558,7 @@ static void _event_cb(netdev_t *dev, netdev_event_t event)
 
                     printf("[PRIVATE] %s -> %s (%d): %s\n",
                         sender, target, msg_id, msg_content);
+                    update_hist(sender,strlen(sender),msg_id,msg_content,strlen(msg_content));
 
                     update_user(sender, msg_id);
                 }
@@ -550,7 +572,7 @@ static void _event_cb(netdev_t *dev, netdev_event_t event)
                         if (strcmp(subscribed_channels[i], target) == 0) {
                             printf("[CHANNEL #%s] %s -> %s (%d): %s\n",
                                 target, sender, target, msg_id, msg_content);
-
+                            update_hist(sender,strlen(sender),msg_id,msg_content,strlen(msg_content));
                             update_user(sender, msg_id);
                             break;
                         }
@@ -559,6 +581,11 @@ static void _event_cb(netdev_t *dev, netdev_event_t event)
             }
             else {
                 printf("Unknown message format\n");
+                printf(
+                "{Payload: \"%s\" (%d bytes), RSSI: %i, SNR: %i, TOA: %" PRIu32 "}\n",
+                message, (int)len,
+                packet_info.rssi, (int)packet_info.snr,
+                sx127x_get_time_on_air((const sx127x_t *)dev, len));
             }
 
             break;
@@ -828,6 +855,24 @@ int unsubscribe_cmd(int argc, char **argv)
     return 1;
 }
 
+int print_hist(int argc, char**argv){
+    (void)argc;
+    (void)argv;
+    uint8_t i=hist_first;
+    if (hist_first==hist_last){
+        printf("History is empty");
+        return 0;
+    }
+    while(i!=hist_last){
+        printf("%s:%d:%s", 
+                hist_buf[i].from,
+                hist_buf[i].msg_id,
+                hist_buf[i].content);
+        i=(i+1)%32;
+    }
+    return 0;
+}
+
 static const shell_command_t shell_commands[] = {
 	{ "init",    "Initialize SX1272",     					    init_sx1272_cmd },
 	{ "setup",    "Initialize LoRa modulation settings",        lora_setup_cmd },
@@ -847,6 +892,7 @@ static const shell_command_t shell_commands[] = {
     { "subscribe",   "Subscribe to a channel (#channel)",       subscribe_cmd },
     { "unsubscribe", "Unsubscribe from a channel (#channel)",   unsubscribe_cmd },
     { "users",   "List known users",                            users_cmd },
+    { "hist",    "Display last recieved messages", print_hist },
     { NULL, NULL, NULL }
 };
 
