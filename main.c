@@ -64,7 +64,7 @@ int messageCounter = 0;
 
 
 /* Username */
-#define MAX_USERNAME_LEN 32
+#define MAX_USERNAME_LEN 4
 char *username = NULL;
 
 /* Channels */
@@ -539,22 +539,52 @@ static void _event_cb(netdev_t *dev, netdev_event_t event)
             break;
 
         case NETDEV_EVENT_RX_COMPLETE:
+
             len = dev->driver->recv(dev, NULL, 0, 0);
             dev->driver->recv(dev, message, len, &packet_info);
+            printf("Received message: \"%s\" (%d bytes)\n", message, (int)len);
             // printf(
             //     "{Payload: \"%s\" (%d bytes), RSSI: %i, SNR: %i, TOA: %" PRIu32 "}\n",
             //     message, (int)len,
             //     packet_info.rssi, (int)packet_info.snr,
             //     sx127x_get_time_on_air((const sx127x_t *)dev, len));
-            char sender[32];
-            char target[32];
-            char msg_content[256];
-            int msg_id;
+            char sender[32] = {0};
+            char target[32] = {0};
+            char msg_content[256] = {0};
+            int msg_id = 0;
 
+            strncpy(sender, message, MAX_USERNAME_LEN);
+            sender[MAX_USERNAME_LEN] = '\0';
+
+            strncpy(target, message + MAX_USERNAME_LEN + 1, MAX_USERNAME_LEN);
+            target[MAX_CHANNEL_LEN] = '\0';
+
+            // Look for first ':'
+            int first_colon = -1;
+            for (int i = 0; i < len; i++) {
+                if (message[i] == ':') {
+                    first_colon = i;
+                    break;
+                }
+            }
+
+
+
+
+
+            
             if (strchr(message, '@') != NULL) {
+                printf("Private message received\n");
+
+                int ret = sscanf(message, "%31[^@]@%31[^:]",
+                        sender, target);
+                printf("sscanf returned %d\n", ret);
+                printf("Parsed sender: %s, target: %s, msg_id: %d, content: %s\n",
+                        sender, target, msg_id, msg_content);
 
                 if (sscanf(message, "%31[^@]@%31[^:]:%d:%63[^\n]",
                         sender, target, &msg_id, msg_content) == 4) {
+
 
                     printf("[PRIVATE] %s -> %s (%d): %s\n",
                         sender, target, msg_id, msg_content);
@@ -562,6 +592,7 @@ static void _event_cb(netdev_t *dev, netdev_event_t event)
 
                     update_user(sender, msg_id);
                 }
+                printf("Unable to parse private message\n");
             }
 
             else if (strchr(message, '#') != NULL) {
@@ -764,8 +795,9 @@ int msg_cmd(int argc, char **argv)
         return 1;
     }
 
-    const char *target = argv[1];
-    const char *message = argv[2];
+    const char* type = argv[1];
+    const char *target = argv[2];
+    const char *message = argv[3];
     const int message_number = messageCounter++;
 
     /* '@' + ':' + ':' + '\0' = 4,  message_number (int32) max 10 digits */
@@ -777,13 +809,13 @@ int msg_cmd(int argc, char **argv)
         return 1;
     }
 
-    snprintf(payload, payload_size, "%s@%s:%d:%s", username, target, message_number, message);
+    snprintf(payload, payload_size, "%s%s%s:%d:%s", username, type, target, message_number, message);
 
     printf("Sending: %s\n", payload);
 
     iolist_t iolist = {
         .iol_base = payload,
-        .iol_len = strlen(payload) + 1
+        .iol_len = (strlen(payload) + 1)
     };
 
     netdev_t *netdev = &sx127x.netdev;
@@ -888,7 +920,7 @@ static const shell_command_t shell_commands[] = {
     { "listen",   "Start raw payload listener",                 listen_cmd },
     { "reset",    "Reset the sx127x device",                    reset_cmd },
     { "setname", "Set username (setname <username>)",           set_username_cmd },
-    { "msg",      "Send unicast/broadcast msg (msg <to> <txt>)",msg_cmd },
+    { "msg",      "Send unicast/broadcast msg (msg <@|#> <to> <txt>)",msg_cmd },
     { "subscribe",   "Subscribe to a channel (#channel)",       subscribe_cmd },
     { "unsubscribe", "Unsubscribe from a channel (#channel)",   unsubscribe_cmd },
     { "users",   "List known users",                            users_cmd },
