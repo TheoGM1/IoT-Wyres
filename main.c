@@ -64,7 +64,7 @@ int messageCounter = 0;
 
 
 /* Username */
-#define MAX_USERNAME_LEN 4
+#define NAME_LEN 4
 char *username = NULL;
 
 /* Channels */
@@ -76,7 +76,7 @@ static int  channel_count = 0;
 
 /* Storing user information */
 typedef struct {
-    char name[MAX_USERNAME_LEN];
+    char name[NAME_LEN];
     int last_msg_id;
     uint32_t last_seen;   // timestamp logique
 } user_t;
@@ -90,7 +90,7 @@ static user_t users[MAX_USERS];
 static int user_count = 0;
 
 typedef struct history_elt{
-    char from[MAX_USERNAME_LEN];
+    char from[NAME_LEN];
     int msg_id;
     char content[256];
 }hist_elt_t;
@@ -548,69 +548,60 @@ static void _event_cb(netdev_t *dev, netdev_event_t event)
             //     message, (int)len,
             //     packet_info.rssi, (int)packet_info.snr,
             //     sx127x_get_time_on_air((const sx127x_t *)dev, len));
-            char sender[32] = {0};
-            char target[32] = {0};
+            char sender[NAME_LEN+1] = {0};
+            char target[NAME_LEN+1] = {0};
             char msg_content[256] = {0};
             int msg_id = 0;
 
-            strncpy(sender, message, MAX_USERNAME_LEN);
-            sender[MAX_USERNAME_LEN] = '\0';
+            strncpy(sender, message, NAME_LEN);
+            sender[NAME_LEN] = '\0';
 
-            strncpy(target, message + MAX_USERNAME_LEN + 1, MAX_USERNAME_LEN);
-            target[MAX_CHANNEL_LEN] = '\0';
+            strncpy(target, message + NAME_LEN + 1, NAME_LEN);
+            target[NAME_LEN] = '\0';
 
             // Look for first ':'
             int first_colon = -1;
+            int second_colon=-1;
+            int cpt=0;
             for (int i = 0; i < len; i++) {
                 if (message[i] == ':') {
-                    first_colon = i;
-                    break;
+                    if (cpt==0){
+                        first_colon = i;
+                        cpt++;
+                    }else{
+                        second_colon=i;
+                        break;
+                    }
                 }
             }
+            char buf[32]={0};
+            strncpy(buf,message+first_colon+1,second_colon-first_colon-1);
+            buf[second_colon-first_colon]='\0';
+            msg_id=atoi(buf);
+            strncpy(msg_content,message+second_colon,strlen(message)-second_colon);
 
-
-
-
-
-            
-            if (strchr(message, '@') != NULL) {
-                printf("Private message received\n");
-
-                int ret = sscanf(message, "%31[^@]@%31[^:]",
-                        sender, target);
-                printf("sscanf returned %d\n", ret);
-                printf("Parsed sender: %s, target: %s, msg_id: %d, content: %s\n",
-                        sender, target, msg_id, msg_content);
-
-                if (sscanf(message, "%31[^@]@%31[^:]:%d:%63[^\n]",
-                        sender, target, &msg_id, msg_content) == 4) {
-
-
-                    printf("[PRIVATE] %s -> %s (%d): %s\n",
-                        sender, target, msg_id, msg_content);
-                    update_hist(sender,strlen(sender),msg_id,msg_content,strlen(msg_content));
-
-                    update_user(sender, msg_id);
+            if (message+4=='@'){
+                if (strcmp(username,target)==0){
+                    //the user is the target
+                    printf("Private message received\n");
+                    printf("@%s[%d] : %s\n",sender,msg_id,msg_content);
+                    update_hist(sender,NAME_LEN,msg_id,msg_content,strlen(msg_content));
+                    update_user(sender,msg_id);
+                }else{
+                    //not for us, #TODO redirection for LoRaWAN
                 }
-                printf("Unable to parse private message\n");
-            }
-
-            else if (strchr(message, '#') != NULL) {
-
-                if (sscanf(message, "%31[^#]#%31[^:]:%d:%63[^\n]",sender, target, &msg_id, msg_content) == 4) {
-
-                    for (int i = 0; i < channel_count; i++) {
+            }else if (message+4=="#")
+            {
+                for (int i = 0; i < channel_count; i++) {
                         if (strcmp(subscribed_channels[i], target) == 0) {
-                            printf("[CHANNEL #%s] %s -> %s (%d): %s\n",
-                                target, sender, target, msg_id, msg_content);
-                            update_hist(sender,strlen(sender),msg_id,msg_content,strlen(msg_content));
+                            printf("[CHANNEL #%s]@%s[%d] : %s\n",
+                                target, sender, msg_id, msg_content);
+                            update_hist(sender,NAME_LEN,msg_id,msg_content,strlen(msg_content));
                             update_user(sender, msg_id);
                             break;
                         }
                     }
-                }
-            }
-            else {
+            }else{
                 printf("Unknown message format\n");
                 printf(
                 "{Payload: \"%s\" (%d bytes), RSSI: %i, SNR: %i, TOA: %" PRIu32 "}\n",
@@ -618,8 +609,6 @@ static void _event_cb(netdev_t *dev, netdev_event_t event)
                 packet_info.rssi, (int)packet_info.snr,
                 sx127x_get_time_on_air((const sx127x_t *)dev, len));
             }
-
-            break;
 
         case NETDEV_EVENT_TX_COMPLETE:
             sx127x_set_sleep(&sx127x);
@@ -726,8 +715,8 @@ static void update_user(const char *name, int msg_id)
 
     /* nouveau utilisateur */
     if (user_count < MAX_USERS) {
-        strncpy(users[user_count].name, name, MAX_USERNAME_LEN - 1);
-        users[user_count].name[MAX_USERNAME_LEN - 1] = '\0';
+        strncpy(users[user_count].name, name, NAME_LEN - 1);
+        users[user_count].name[NAME_LEN - 1] = '\0';
         users[user_count].last_msg_id = msg_id;
         users[user_count].last_seen = user_timestamp;
         user_count++;
@@ -738,8 +727,8 @@ static void update_user(const char *name, int msg_id)
 
         printf("User table full replacing %s\n", users[oldest].name);
 
-        strncpy(users[oldest].name, name, MAX_USERNAME_LEN - 1);
-        users[oldest].name[MAX_USERNAME_LEN - 1] = '\0';
+        strncpy(users[oldest].name, name, NAME_LEN - 1);
+        users[oldest].name[NAME_LEN - 1] = '\0';
         users[oldest].last_msg_id = msg_id;
         users[oldest].last_seen = user_timestamp;
     }
@@ -772,13 +761,13 @@ int set_username_cmd(int argc, char **argv)
     }
 
     free(username);
-    username = malloc(MAX_USERNAME_LEN);
+    username = malloc(NAME_LEN+1);
     if (username == NULL) {
         printf("Failed to allocate memory for username\n");
         return 1;
     }
-    username = strncpy(username, argv[1], MAX_USERNAME_LEN - 1);
-    username[MAX_USERNAME_LEN - 1] = '\0';
+    username = strncpy(username, argv[1], NAME_LEN);
+    username[NAME_LEN] = '\0';
     printf("Username set to: %s\n", username);
     return 0;
 }
