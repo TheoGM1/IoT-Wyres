@@ -563,7 +563,7 @@ static void _event_cb(netdev_t *dev, netdev_event_t event)
             int first_colon = -1;
             int second_colon=-1;
             int cpt=0;
-            for (int i = 0; i < len; i++) {
+            for (size_t i = 0; i < len; i++) {
                 if (message[i] == ':') {
                     if (cpt==0){
                         first_colon = i;
@@ -580,7 +580,7 @@ static void _event_cb(netdev_t *dev, netdev_event_t event)
             msg_id=atoi(buf);
             strncpy(msg_content,message+second_colon,strlen(message)-second_colon);
 
-            if (message+4=='@'){
+            if (message[4]=='@'){
                 if (strcmp(username,target)==0){
                     //the user is the target
                     printf("Private message received\n");
@@ -590,7 +590,7 @@ static void _event_cb(netdev_t *dev, netdev_event_t event)
                 }else{
                     //not for us, #TODO redirection for LoRaWAN
                 }
-            }else if (message+4=="#")
+            }else if (message[4]=='#')
             {
                 for (int i = 0; i < channel_count; i++) {
                         if (strcmp(subscribed_channels[i], target) == 0) {
@@ -609,7 +609,7 @@ static void _event_cb(netdev_t *dev, netdev_event_t event)
                 packet_info.rssi, (int)packet_info.snr,
                 sx127x_get_time_on_air((const sx127x_t *)dev, len));
             }
-
+            break;
         case NETDEV_EVENT_TX_COMPLETE:
             sx127x_set_sleep(&sx127x);
             puts("Transmission completed");
