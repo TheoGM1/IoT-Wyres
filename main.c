@@ -73,6 +73,7 @@ char *username = NULL;
 
 static char subscribed_channels[MAX_CHANNELS][MAX_CHANNEL_LEN];
 static int  channel_count = 0;
+static int SNRThreshold=32; // arbitrary value, maybe need to be changed
 
 /* Storing user information */
 typedef struct {
@@ -93,6 +94,7 @@ typedef struct history_elt{
     char from[NAME_LEN];
     int msg_id;
     char content[256];
+    int SNR=0;
 }hist_elt_t;
 
 static hist_elt_t hist_buf[32];
@@ -104,8 +106,16 @@ uint8_t hist_last=0;
 /// Functions declaration
 static int find_oldest_user(void);
 static void update_user(const char *name, int msg_id);
+int in_hist(char* msg);
 
 void update_hist(char* from,int from_l,int msg_id,char* msg,int msg_l){
+    int in=in_hist(msg);
+    if(in!=0){
+        in--;//decrement to get the real value
+        hist_buf[in].SNR++;//temp, à voir comment on le calcule ig ...
+        return;
+    }
+
     strncpy(hist_buf[hist_last].from,from,from_l);
     strncpy(hist_buf[hist_last].from,from,from_l);
     hist_buf[hist_last].msg_id=msg_id;
@@ -114,6 +124,18 @@ void update_hist(char* from,int from_l,int msg_id,char* msg,int msg_l){
     if (hist_last==hist_first){
         hist_first=(hist_first+1)%32;
     }
+}
+
+int in_hist(char* msg){
+
+    uint8_t i=hist_first;
+    while(i!=hist_last){
+        if (strcmp(msg,hist_buf[i].content)){
+            return i+1;// return elt rank+1 to avoid collision with 0 for not found
+        }
+        i=(i+1)%32;
+    }
+    return 0;
 }
 
 int lora_setup_cmd(int argc, char **argv)
@@ -894,6 +916,20 @@ int print_hist(int argc, char**argv){
     return 0;
 }
 
+
+int setSNRThreshold(int argc,char**argv){
+    if (argc < 2) {
+        printf("usage: %s <username>\n", argv[0]);
+        return 1;
+    }
+    int newSNRThreshold= atoi(argv[1]);
+    if (newSNRThreshold< 0){
+        print("Invalid input : '%s', abort\n",argv[1]);
+    }else{
+        SNRThreshold=newSNRThreshold;
+    }
+}
+
 static const shell_command_t shell_commands[] = {
 	{ "init",    "Initialize SX1272",     					    init_sx1272_cmd },
 	{ "setup",    "Initialize LoRa modulation settings",        lora_setup_cmd },
@@ -914,6 +950,7 @@ static const shell_command_t shell_commands[] = {
     { "unsubscribe", "Unsubscribe from a channel (#channel)",   unsubscribe_cmd },
     { "users",   "List known users",                            users_cmd },
     { "hist",    "Display last recieved messages", print_hist },
+    { "set_snr", "Set the SNR Threshold to the given value, default : 32",setSNRThreshold}
     { NULL, NULL, NULL }
 };
 
