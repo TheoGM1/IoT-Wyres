@@ -94,7 +94,7 @@ typedef struct history_elt{
     char from[NAME_LEN];
     int msg_id;
     char content[256];
-    int SNR=0;
+    int8_t SNR;
 }hist_elt_t;
 
 static hist_elt_t hist_buf[32];
@@ -108,11 +108,11 @@ static int find_oldest_user(void);
 static void update_user(const char *name, int msg_id);
 int in_hist(char* msg);
 
-void update_hist(char* from,int from_l,int msg_id,char* msg,int msg_l){
+void update_hist(char* from,int from_l,int msg_id,char* msg,int msg_l,int8_t snr){
     int in=in_hist(msg);
     if(in!=0){
         in--;//decrement to get the real value
-        hist_buf[in].SNR++;//temp, à voir comment on le calcule ig ...
+        hist_buf[in].SNR=snr;//update snr to not repeat the message too much
         return;
     }
 
@@ -120,6 +120,7 @@ void update_hist(char* from,int from_l,int msg_id,char* msg,int msg_l){
     strncpy(hist_buf[hist_last].from,from,from_l);
     hist_buf[hist_last].msg_id=msg_id;
     strncpy(hist_buf[hist_last].content,msg,msg_l);
+    hist_buf[hist_last].SNR=snr;
     hist_last=(hist_last+1)%32;
     if (hist_last==hist_first){
         hist_first=(hist_first+1)%32;
@@ -607,7 +608,7 @@ static void _event_cb(netdev_t *dev, netdev_event_t event)
                     //the user is the target
                     printf("Private message received\n");
                     printf("@%s[%d] : %s\n",sender,msg_id,msg_content);
-                    update_hist(sender,NAME_LEN,msg_id,msg_content,strlen(msg_content));
+                    update_hist(sender,NAME_LEN,msg_id,msg_content,strlen(msg_content),packet_info.snr);
                     update_user(sender,msg_id);
                 }else{
                     //not for us, #TODO redirection for LoRaWAN
@@ -618,7 +619,7 @@ static void _event_cb(netdev_t *dev, netdev_event_t event)
                         if (strcmp(subscribed_channels[i], target) == 0) {
                             printf("[CHANNEL #%s]@%s[%d] : %s\n",
                                 target, sender, msg_id, msg_content);
-                            update_hist(sender,NAME_LEN,msg_id,msg_content,strlen(msg_content));
+                            update_hist(sender,NAME_LEN,msg_id,msg_content,strlen(msg_content),packet_info.snr);
                             update_user(sender, msg_id);
                             break;
                         }
@@ -924,10 +925,11 @@ int setSNRThreshold(int argc,char**argv){
     }
     int newSNRThreshold= atoi(argv[1]);
     if (newSNRThreshold< 0){
-        print("Invalid input : '%s', abort\n",argv[1]);
+        printf("Invalid input : '%s', abort\n",argv[1]);
     }else{
         SNRThreshold=newSNRThreshold;
     }
+    return 0;
 }
 
 static const shell_command_t shell_commands[] = {
@@ -950,7 +952,7 @@ static const shell_command_t shell_commands[] = {
     { "unsubscribe", "Unsubscribe from a channel (#channel)",   unsubscribe_cmd },
     { "users",   "List known users",                            users_cmd },
     { "hist",    "Display last recieved messages", print_hist },
-    { "set_snr", "Set the SNR Threshold to the given value, default : 32",setSNRThreshold}
+    { "set_snr", "Set the SNR Threshold to the given value, default : 32",setSNRThreshold},
     { NULL, NULL, NULL }
 };
 
