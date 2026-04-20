@@ -285,7 +285,7 @@ int update_hist(int8_t snr, const chat_msg_t *parsed)
 
         e->last_seen = ++hist_timestamp;
 
-        if ((e->relay_status == RELAY_STATUS_PENDING) && (e->first_snr > snr_threshold) && (snr > snr_threshold)) {
+        if ((e->relay_status == RELAY_STATUS_PENDING) && (snr > e->first_snr) && (snr > snr_threshold)) {
             e->relay_status = RELAY_STATUS_CANCELED;
             e->time_to_send = 0;
         }
