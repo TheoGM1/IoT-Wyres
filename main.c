@@ -178,7 +178,7 @@ static int build_chat_payload(const chat_msg_t *msg, bool include_ttl,
 
 static void schedule_relay_if_needed(const chat_msg_t *parsed, int8_t snr)
 {
-    if ((parsed == NULL) || !parsed->has_ttl || (parsed->ttl <= 0)) {
+    if ((parsed == NULL) || !parsed->has_ttl || (parsed->ttl <= 0) || (strcmp(username,parsed->to))){
         return;
     }
 
@@ -306,7 +306,7 @@ int update_hist(int8_t snr, const chat_msg_t *parsed)
 
     hist_last = (hist_last + 1) % HIST_SIZE;
     if (hist_last == hist_first) {
-        hist_first = (hist_first + 1) % HIST_SIZE;
+        hist_first = (hist_first + 1) % HIST_SIZE;        
     }
 
     return 1;
