@@ -29,12 +29,15 @@
 #include "thread.h"
 #include "shell.h"
 //#include "shell_commands.h"
+#include "ztimer.h"
 
 #include "net/netdev.h"
 #include "net/netdev/lora.h"
 #include "net/lora.h"
 
 #include "board.h"
+
+#include "checksum/crc32.h"
 
 #include "sx127x_internal.h"
 #include "sx127x_params.h"
@@ -48,9 +51,13 @@
 #endif
 
 #define MSG_TYPE_ISR            (0x3456)
+#define RELAY_DELAY_MS          (500U)
+#define RELAY_SLEEP_MS           (50U)
 
 static char stack[SX127X_STACKSIZE];
+static char relay_stack[SX127X_STACKSIZE];
 static kernel_pid_t _recv_pid;
+static kernel_pid_t _relay_pid;
 
 static char message[256];
 static sx127x_t sx127x;
@@ -89,31 +96,220 @@ static uint32_t user_timestamp = 0;
 static user_t users[MAX_USERS];
 static int user_count = 0;
 
-typedef struct history_elt{
-    char from[NAME_LEN];
+/* Message */
+typedef struct {
+    char from[NAME_LEN + 1];
+    char mode;
+    char to[MAX_CHANNEL_LEN];
     int msg_id;
+    int has_ttl;
+    int ttl;
     char content[256];
-}hist_elt_t;
+} chat_msg_t;
 
-static hist_elt_t hist_buf[32];
-uint8_t hist_first=0;
-uint8_t hist_last=0;
+typedef enum {
+    RELAY_STATUS_RECEIVED = 0,
+    RELAY_STATUS_PENDING,
+    RELAY_STATUS_RELAYED,
+    RELAY_STATUS_CANCELED,
+} relay_status_t;
 
+typedef struct {
+    uint32_t crc; // CRC to check if message is already seen
+    int8_t first_snr; // SNR of the first reception of the message, used to cancel relay if we receive the same message with better snr
+    uint32_t last_seen; // Timestamp to know which is the oldest one
+    relay_status_t relay_status;
+
+    uint32_t time_to_send; // Timestamp to know when to send the message
+
+    chat_msg_t msg; // Parsed message
+} history_elt_t;
+
+#define HIST_SIZE 32
+static history_elt_t hist_buf[HIST_SIZE];
+static int hist_first = 0;
+static int hist_last = 0;
+static uint32_t hist_timestamp = 0;
+
+/* Relay */
+static int8_t snr_threshold = -5;
 //////////////////////////////////////////
 
 /// Functions declaration
 static int find_oldest_user(void);
 static void update_user(const char *name, int msg_id);
+int parse_chat_msg(const char *buf, size_t len, chat_msg_t *out);
+static int hist_find_crc(uint32_t crc);
+static uint32_t compute_crc(const chat_msg_t *parsed);
+static void relay_process_pending(void);
+static int build_chat_payload(const chat_msg_t *msg, bool include_ttl,
+                              char *out, size_t out_len);
 
-void update_hist(char* from,int from_l,int msg_id,char* msg,int msg_l){
-    strncpy(hist_buf[hist_last].from,from,from_l);
-    strncpy(hist_buf[hist_last].from,from,from_l);
-    hist_buf[hist_last].msg_id=msg_id;
-    strncpy(hist_buf[hist_last].content,msg,msg_l);
-    hist_last=(hist_last+1)%32;
-    if (hist_last==hist_first){
-        hist_first=(hist_first+1)%32;
+static bool time_reached(uint32_t now, uint32_t target)
+{
+    return ((int32_t)(now - target) >= 0);
+}
+
+static int build_chat_payload(const chat_msg_t *msg, bool include_ttl,
+                              char *out, size_t out_len)
+{
+    if ((msg == NULL) || (out == NULL) || (out_len == 0)) {
+        return -1;
     }
+
+    int wrote;
+    if (include_ttl) {
+        wrote = snprintf(out, out_len, "%s%c%s:%d,%d:%s",
+                         msg->from, msg->mode, msg->to,
+                         msg->msg_id, msg->ttl, msg->content);
+    }
+    else {
+        wrote = snprintf(out, out_len, "%s%c%s:%d:%s",
+                         msg->from, msg->mode, msg->to,
+                         msg->msg_id, msg->content);
+    }
+
+    if ((wrote < 0) || ((size_t)wrote >= out_len)) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static void schedule_relay_if_needed(const chat_msg_t *parsed, int8_t snr)
+{
+    if ((parsed == NULL) || !parsed->has_ttl || (parsed->ttl <= 0)) {
+        return;
+    }
+
+    int idx = hist_find_crc(compute_crc(parsed));
+    if (idx < 0) {
+        return;
+    }
+
+    history_elt_t *e = &hist_buf[idx];
+
+    if (e->relay_status == RELAY_STATUS_RELAYED) {
+        return;
+    }
+
+    e->relay_status = RELAY_STATUS_PENDING;
+    e->first_snr = snr;
+    e->time_to_send = ztimer_now(ZTIMER_MSEC) + RELAY_DELAY_MS;
+}
+
+static void relay_process_pending(void)
+{
+    uint32_t now = ztimer_now(ZTIMER_MSEC);
+
+    for (int i = hist_first; i != hist_last; i = (i + 1) % HIST_SIZE) {
+        history_elt_t *e = &hist_buf[i];
+        chat_msg_t relay_msg;
+
+        if (e->relay_status != RELAY_STATUS_PENDING) {
+            continue;
+        }
+
+        if (!time_reached(now, e->time_to_send)) {
+            continue;
+        }
+
+        relay_msg = e->msg;
+
+        if (!relay_msg.has_ttl || (relay_msg.ttl <= 0)) {
+            e->relay_status = RELAY_STATUS_CANCELED;
+            continue;
+        }
+
+        relay_msg.ttl--;
+        char relay_payload[256];
+
+        if (build_chat_payload(&relay_msg, true, relay_payload, sizeof(relay_payload)) != 0) {
+            e->relay_status = RELAY_STATUS_CANCELED;
+            continue;
+        }
+
+        iolist_t iolist = {
+            .iol_base = relay_payload,
+            .iol_len = strlen(relay_payload) + 1,
+        };
+
+        netdev_t *netdev = &sx127x.netdev;
+        if (netdev->driver->send(netdev, &iolist) == -ENOTSUP) {
+            e->time_to_send = now + RELAY_SLEEP_MS;
+            continue;
+        }
+
+        e->msg.ttl = relay_msg.ttl;
+        e->relay_status = RELAY_STATUS_RELAYED;
+        e->time_to_send = 0;
+    }
+}
+
+static int hist_find_crc(uint32_t crc)
+{
+    int i = hist_first;
+
+    while (i != hist_last) {
+        if (hist_buf[i].crc == crc) {
+            return i;
+        }
+        i = (i + 1) % HIST_SIZE;
+    }
+
+    return -1;
+}
+
+static uint32_t compute_crc(const chat_msg_t *parsed)
+{
+    char payload_no_ttl[sizeof(parsed->content) + MAX_CHANNEL_LEN + NAME_LEN + 24];
+
+    if (parsed == NULL) {
+        return 0;
+    }
+
+    if (build_chat_payload(parsed, false, payload_no_ttl, sizeof(payload_no_ttl)) != 0) {
+        return 0;
+    }
+
+    return crc32(payload_no_ttl, strlen(payload_no_ttl));
+}
+
+int update_hist(int8_t snr, const chat_msg_t *parsed)
+{
+    uint32_t crc = compute_crc(parsed);
+    int existing_idx = hist_find_crc(crc);
+
+    if (existing_idx >= 0) {
+        history_elt_t *e = &hist_buf[existing_idx];
+
+        e->last_seen = ++hist_timestamp;
+
+        if ((e->relay_status == RELAY_STATUS_PENDING) && (e->first_snr > snr_threshold) && (snr > snr_threshold)) {
+            e->relay_status = RELAY_STATUS_CANCELED;
+            e->time_to_send = 0;
+        }
+
+        return 0;
+    }
+
+    history_elt_t *e = &hist_buf[hist_last];
+
+    e->crc = crc;
+
+    e->msg = *parsed;
+
+    e->first_snr = snr;
+    e->last_seen = ++hist_timestamp;
+    e->relay_status = RELAY_STATUS_RECEIVED;
+    e->time_to_send = 0;
+
+    hist_last = (hist_last + 1) % HIST_SIZE;
+    if (hist_last == hist_first) {
+        hist_first = (hist_first + 1) % HIST_SIZE;
+    }
+
+    return 1;
 }
 
 int lora_setup_cmd(int argc, char **argv)
@@ -539,76 +735,60 @@ static void _event_cb(netdev_t *dev, netdev_event_t event)
             break;
 
         case NETDEV_EVENT_RX_COMPLETE:
-
             len = dev->driver->recv(dev, NULL, 0, 0);
             dev->driver->recv(dev, message, len, &packet_info);
             printf("Received message: \"%s\" (%d bytes)\n", message, (int)len);
-            // printf(
-            //     "{Payload: \"%s\" (%d bytes), RSSI: %i, SNR: %i, TOA: %" PRIu32 "}\n",
-            //     message, (int)len,
-            //     packet_info.rssi, (int)packet_info.snr,
-            //     sx127x_get_time_on_air((const sx127x_t *)dev, len));
-            char sender[NAME_LEN+1] = {0};
-            char target[NAME_LEN+1] = {0};
-            char msg_content[256] = {0};
-            int msg_id = 0;
 
-            strncpy(sender, message, NAME_LEN);
-            sender[NAME_LEN] = '\0';
+            chat_msg_t *parsed = malloc(sizeof(chat_msg_t));
+            if (parsed == NULL) {
+                printf("Failed to allocate memory for parsed message\n");
+                break;
+            }
 
-            strncpy(target, message + NAME_LEN + 1, NAME_LEN);
-            target[NAME_LEN] = '\0';
+            if (parse_chat_msg(message, len, parsed) != 0) {
+                printf("Unknown message format\n");
+                printf("{Payload: \"%s\" (%d bytes), RSSI: %i, SNR: %i, TOA: %" PRIu32 "}\n",
+                    message, (int)len,
+                    packet_info.rssi, (int)packet_info.snr,
+                    sx127x_get_time_on_air((const sx127x_t *)dev, len));
+                break;
+            }
 
-            // Look for first ':'
-            int first_colon = -1;
-            int second_colon=-1;
-            int cpt=0;
-            for (size_t i = 0; i < len; i++) {
-                if (message[i] == ':') {
-                    if (cpt==0){
-                        first_colon = i;
-                        cpt++;
-                    }else{
-                        second_colon=i;
+            int hist_added = update_hist((int8_t)packet_info.snr, parsed);
+            if (!hist_added) {
+                printf("Duplicate message ignored for history\n");
+            }
+
+            if (!parsed->has_ttl) {
+                printf("Relay skipped: no TTL field");
+            }
+            else if (parsed->ttl <= 0) {
+                printf("Relay skipped: TTL <= 0");
+            }
+            else if (hist_added) {
+                // Here we have a ttl and its > 0
+                schedule_relay_if_needed(parsed, (int8_t)packet_info.snr);
+                printf("Relay pending in %u ms\n", (unsigned)RELAY_DELAY_MS);
+            }
+
+            if (parsed->mode == '@') {
+                if (strcmp(username, parsed->to) == 0) {
+                    printf("Private message received\n");
+                    printf("@%s[%d] : %s\n", parsed->from, parsed->msg_id, parsed->content);
+                }
+                update_user(parsed->from, parsed->msg_id);
+            }
+            else { /* '#' */
+                for (int i = 0; i < channel_count; i++) {
+                    if (strcmp(subscribed_channels[i], parsed->to) == 0) {
+                        printf("[CHANNEL #%s]@%s[%d] : %s\n",
+                            parsed->to, parsed->from, parsed->msg_id, parsed->content);
+                        update_user(parsed->from, parsed->msg_id);
                         break;
                     }
                 }
             }
-            char buf[32]={0};
-            strncpy(buf,message+first_colon+1,second_colon-first_colon-1);
-            buf[second_colon-first_colon]='\0';
-            msg_id=atoi(buf);
-            strncpy(msg_content,message+second_colon,strlen(message)-second_colon);
-
-            if (message[4]=='@'){
-                if (strcmp(username,target)==0){
-                    //the user is the target
-                    printf("Private message received\n");
-                    printf("@%s[%d] : %s\n",sender,msg_id,msg_content);
-                    update_hist(sender,NAME_LEN,msg_id,msg_content,strlen(msg_content));
-                    update_user(sender,msg_id);
-                }else{
-                    //not for us, #TODO redirection for LoRaWAN
-                }
-            }else if (message[4]=='#')
-            {
-                for (int i = 0; i < channel_count; i++) {
-                        if (strcmp(subscribed_channels[i], target) == 0) {
-                            printf("[CHANNEL #%s]@%s[%d] : %s\n",
-                                target, sender, msg_id, msg_content);
-                            update_hist(sender,NAME_LEN,msg_id,msg_content,strlen(msg_content));
-                            update_user(sender, msg_id);
-                            break;
-                        }
-                    }
-            }else{
-                printf("Unknown message format\n");
-                printf(
-                "{Payload: \"%s\" (%d bytes), RSSI: %i, SNR: %i, TOA: %" PRIu32 "}\n",
-                message, (int)len,
-                packet_info.rssi, (int)packet_info.snr,
-                sx127x_get_time_on_air((const sx127x_t *)dev, len));
-            }
+            free(parsed);
             break;
         case NETDEV_EVENT_TX_COMPLETE:
             sx127x_set_sleep(&sx127x);
@@ -650,6 +830,16 @@ void *_recv_thread(void *arg)
     }
 }
 
+void *_relay_thread(void *arg)
+{
+    (void)arg;
+
+    while (1) {
+        relay_process_pending();
+        ztimer_sleep(ZTIMER_MSEC, RELAY_SLEEP_MS);
+    }
+}
+
 
 int init_sx1272_cmd(int argc, char **argv)
 {
@@ -678,6 +868,15 @@ int init_sx1272_cmd(int argc, char **argv)
 	        puts("Creation of receiver thread failed");
 	        return 1;
 	    }
+
+        _relay_pid = thread_create(relay_stack, sizeof(relay_stack), THREAD_PRIORITY_MAIN - 2,
+                                   THREAD_CREATE_STACKTEST, _relay_thread, NULL,
+                                   "relay_thread");
+
+        if (_relay_pid <= KERNEL_PID_UNDEF) {
+            puts("Creation of relay thread failed");
+            return 1;
+        }
         puts("5");
 
         return 0;
@@ -774,8 +973,8 @@ int set_username_cmd(int argc, char **argv)
 
 int msg_cmd(int argc, char **argv)
 {
-    if (argc < 3) {
-        printf("usage: %s <to|*> <message>\n", argv[0]);
+    if (argc < 4) {
+        printf("usage: %s <@|#> <to> <message> [ttl]\n", argv[0]);
         return 1;
     }
 
@@ -784,13 +983,34 @@ int msg_cmd(int argc, char **argv)
         return 1;
     }
 
-    const char* type = argv[1];
+    const char *type = argv[1];
     const char *target = argv[2];
-    const char *message = argv[3];
+    const char *msg_text = argv[3];
     const int message_number = messageCounter++;
+    int has_ttl = 0;
+    int ttl = 0;
 
-    /* '@' + ':' + ':' + '\0' = 4,  message_number (int32) max 10 digits */
-    int payload_size = strlen(username) + strlen(target) + strlen(message) + 4 + 10;
+    if ((strcmp(type, "@") != 0) && (strcmp(type, "#") != 0)) {
+        printf("usage: %s <@|#> <to> <message> [ttl]\n", argv[0]);
+        return 1;
+    }
+
+    if (argc >= 5) {
+        ttl = atoi(argv[4]);
+        if (ttl < 0) {
+            puts("ttl must be >= 0");
+            return 1;
+        }
+        has_ttl = 1;
+    }
+
+    /* base: user + type + to + ':' + id + ':' + msg + '\0' */
+    int payload_size = (int)strlen(username) + (int)strlen(type) + (int)strlen(target) +
+                       (int)strlen(msg_text) + 4 + 10;
+    if (has_ttl) {
+        /* add ',' + ttl (up to 10 digits for int32) */
+        payload_size += 1 + 10;
+    }
 
     char *payload = malloc(payload_size);
     if (payload == NULL) {
@@ -798,7 +1018,14 @@ int msg_cmd(int argc, char **argv)
         return 1;
     }
 
-    snprintf(payload, payload_size, "%s%s%s:%d:%s", username, type, target, message_number, message);
+    if (has_ttl) {
+        snprintf(payload, payload_size, "%s%s%s:%d,%d:%s",
+                 username, type, target, message_number, ttl, msg_text);
+    }
+    else {
+        snprintf(payload, payload_size, "%s%s%s:%d:%s",
+                 username, type, target, message_number, msg_text);
+    }
 
     printf("Sending: %s\n", payload);
 
@@ -876,22 +1103,157 @@ int unsubscribe_cmd(int argc, char **argv)
     return 1;
 }
 
-int print_hist(int argc, char**argv){
+int print_hist(int argc, char **argv)
+{
     (void)argc;
     (void)argv;
-    uint8_t i=hist_first;
-    if (hist_first==hist_last){
-        printf("History is empty");
+
+    int i = hist_first;
+    if (hist_first == hist_last) {
+        puts("History is empty");
         return 0;
     }
-    while(i!=hist_last){
-        printf("%s:%d:%s", 
-                hist_buf[i].from,
-                hist_buf[i].msg_id,
-                hist_buf[i].content);
-        i=(i+1)%32;
+
+    while (i != hist_last) {
+        const history_elt_t *entry = &hist_buf[i];
+        char payload[256];
+        const char *state = (entry->relay_status == RELAY_STATUS_CANCELED) ? "canceled" :
+                            (entry->relay_status == RELAY_STATUS_PENDING) ? "pending" :
+                            (entry->relay_status == RELAY_STATUS_RELAYED) ? "relayed" : "received";
+
+        if (build_chat_payload(&entry->msg, entry->msg.has_ttl, payload, sizeof(payload)) != 0) {
+            strncpy(payload, "<payload-error>", sizeof(payload) - 1);
+            payload[sizeof(payload) - 1] = '\0';
+        }
+
+        printf("[slot=%d] crc=0x%08" PRIx32 " snr=%" PRId8
+               " state=%s last_seen=%" PRIu32 " send_at=%" PRIu32
+               " payload=\"%s\"\n",
+               i,
+               entry->crc,
+               entry->first_snr,
+               state,
+               entry->last_seen,
+               entry->time_to_send,
+               payload);
+
+        i = (i + 1) % HIST_SIZE;
     }
+
     return 0;
+}
+
+int parse_chat_msg(const char *buf, size_t len, chat_msg_t *out)
+{
+    if (buf == NULL || out == NULL) {
+        return -1;
+    }
+
+    memset(out, 0, sizeof(chat_msg_t));
+
+    // Sender
+    strncpy(out->from, buf, NAME_LEN);
+    out->from[NAME_LEN] = '\0';
+
+    // Mode
+    char mode = buf[NAME_LEN];
+    if (mode != '@' && mode != '#') {
+        return -1;
+    }
+    out->mode = mode;
+
+    // Find two colons
+    int colons[2] = {-1, -1};
+    int ncolons = 0;
+
+    for (size_t i = NAME_LEN + 1; i < len && ncolons < 2; i++) {
+        if (buf[i] == ':') {
+            colons[ncolons++] = (int)i;
+        }
+    }
+
+    if (ncolons < 2) {
+        return -1;
+    }
+
+    // Target
+    int to_len = colons[0] - (NAME_LEN + 1);
+    if (to_len <= 0 || to_len >= MAX_CHANNEL_LEN) {
+        return -1;
+    }
+    strncpy(out->to, buf + NAME_LEN + 1, to_len);
+    out->to[to_len] = '\0';
+
+    // msg_id and optional ttl
+    // Two cases:
+    // 1) msg_id only: "123"
+    // 2) msg_id and ttl: "123,456"
+    char id_field[32] = {0};
+    int  id_field_len = colons[1] - colons[0] - 1;
+    if (id_field_len <= 0 || id_field_len >= (int)sizeof(id_field)) {
+        return -1;
+    }
+    strncpy(id_field, buf + colons[0] + 1, id_field_len);
+
+    char *comma = strchr(id_field, ',');
+    if (comma != NULL) {
+        // id_field = "123,456"
+        // Set *comma to '\0' so id_field is now "123\0456"
+        *comma = '\0';
+        // So atoi find 123
+        out->msg_id = atoi(id_field);
+        // And atoi find 456
+        out->ttl = atoi(comma + 1);
+        out->has_ttl = 1;
+    } else {
+        // No ttl, id_field is just "123"
+        out->msg_id = atoi(id_field);
+        out->ttl = 0;
+        out->has_ttl = 0;
+    }
+
+    // Content
+    int content_start = colons[1] + 1;
+    int content_len = (int)len - content_start;
+    if (content_len < 0) content_len = 0;
+    if (content_len >= (int)sizeof(out->content)) content_len = (int)sizeof(out->content) - 1;
+    strncpy(out->content, buf + content_start, content_len);
+    out->content[content_len] = '\0';
+
+    return 0;
+}
+
+int snrth_cmd(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("usage: snrth <get|set>\n");
+        return -1;
+    }
+
+    if (strcmp(argv[1], "get") == 0) {
+        printf("SNR threshold: %" PRId8 "\n", snr_threshold);
+        return 0;
+    }
+
+    if (strcmp(argv[1], "set") == 0) {
+        if (argc < 3) {
+            printf("usage: snrth set <value>\n");
+            return -1;
+        }
+
+        int tmp = atoi(argv[2]);
+        if (tmp < -128 || tmp > 127) {
+            printf("snrth: value out of int8_t range (-128..127)\n");
+            return -1;
+        }
+
+        snr_threshold = (int8_t)tmp;
+        printf("SNR threshold set to %" PRId8 "\n", snr_threshold);
+        return 0;
+    }
+
+    printf("usage: snrth <get|set>\n");
+    return -1;
 }
 
 static const shell_command_t shell_commands[] = {
@@ -909,11 +1271,12 @@ static const shell_command_t shell_commands[] = {
     { "listen",   "Start raw payload listener",                 listen_cmd },
     { "reset",    "Reset the sx127x device",                    reset_cmd },
     { "setname", "Set username (setname <username>)",           set_username_cmd },
-    { "msg",      "Send unicast/broadcast msg (msg <@|#> <to> <txt>)",msg_cmd },
+    { "msg",      "Send msg (msg <@|#> <to> <txt> [ttl])",      msg_cmd },
     { "subscribe",   "Subscribe to a channel (#channel)",       subscribe_cmd },
     { "unsubscribe", "Unsubscribe from a channel (#channel)",   unsubscribe_cmd },
     { "users",   "List known users",                            users_cmd },
     { "hist",    "Display last recieved messages", print_hist },
+    { "snrth",   "Get/Set SNR relay threshold",                 snrth_cmd },
     { NULL, NULL, NULL }
 };
 
@@ -929,4 +1292,3 @@ int main(void) {
 
     return 0;
 }
-
