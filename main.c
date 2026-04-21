@@ -178,7 +178,7 @@ static int build_chat_payload(const chat_msg_t *msg, bool include_ttl,
 
 static void schedule_relay_if_needed(const chat_msg_t *parsed, int8_t snr)
 {
-    if ((parsed == NULL) || !parsed->has_ttl || (parsed->ttl <= 0) || (strcmp(username,parsed->to))){
+    if ((parsed == NULL) || !parsed->has_ttl || (parsed->ttl <= 0) || (strcmp(username,parsed->to)==0)){
         return;
     }
 
